@@ -1,74 +1,176 @@
 #!/usr/bin/env python3
 import asyncio
-import base64
 import functools
-
-import aiohttp
-import json
 import argparse
-import os
-import re
 import sys
-import time
 import warnings
-import yaml
 import tempfile
-from urllib.parse import urlparse
+from typing import Optional, Dict, Any
 
-from badfish.helpers import get_now
-from badfish.helpers.async_lru import alru_cache
-from badfish.helpers.logger import (
-    BadfishLogger,
-)
-
-from logging import (
-    DEBUG,
-    INFO,
-    getLogger,
-)
+from badfish.core.exceptions import BadfishException
+from badfish.core.factory import badfish_factory, RETRIES
+from badfish.helpers.logger import BadfishLogger
+from logging import DEBUG, INFO, getLogger
 
 warnings.filterwarnings("ignore")
 
-RETRIES = 15
+
+class BadfishConfig:
+    """Configuration class to hold all command line arguments for Badfish operations."""
+    
+    def __init__(self, args_dict: Dict[str, Any]):
+        # Core connection settings
+        self.username = args_dict["u"]
+        self.password = args_dict["p"]
+        self.host_type = args_dict["t"]
+        self.interfaces_path = args_dict["i"]
+        self.retries = int(args_dict["retries"])
+        
+        # Boot operations
+        self.force = args_dict["force"]
+        self.pxe = args_dict["pxe"]
+        self.device = args_dict["boot_to"]
+        self.boot_to_type = args_dict["boot_to_type"]
+        self.boot_to_mac = args_dict["boot_to_mac"]
+        self.check_boot = args_dict["check_boot"]
+        self.toggle_boot_device = args_dict["toggle_boot_device"]
+        
+        # Power operations
+        self.reboot_only = args_dict["reboot_only"]
+        self.power_state = args_dict["power_state"]
+        self.power_on = args_dict["power_on"]
+        self.power_off = args_dict["power_off"]
+        self.power_cycle = args_dict["power_cycle"]
+        self.power_consumed_watts = args_dict["get_power_consumed"]
+        
+        # Reset operations
+        self.rac_reset = args_dict["racreset"]
+        self.bmc_reset = args_dict["bmc_reset"]
+        self.factory_reset = args_dict["factory_reset"]
+        
+        # Job operations
+        self.clear_jobs = args_dict["clear_jobs"]
+        self.check_job = args_dict["check_job"]
+        self.list_jobs = args_dict["ls_jobs"]
+        
+        # Inventory operations
+        self.firmware_inventory = args_dict["firmware_inventory"]
+        self.list_interfaces = args_dict["ls_interfaces"]
+        self.list_gpu = args_dict["ls_gpu"]
+        self.list_processors = args_dict["ls_processors"]
+        self.list_memory = args_dict["ls_memory"]
+        self.list_serial = args_dict["ls_serial"]
+        
+        # Virtual media operations
+        self.check_virtual_media = args_dict["check_virtual_media"]
+        self.unmount_virtual_media = args_dict["unmount_virtual_media"]
+        self.mount_virtual_media = args_dict["mount_virtual_media"]
+        self.boot_to_virtual_media = args_dict["boot_to_virtual_media"]
+        
+        # Remote image operations
+        self.check_remote_image = args_dict["check_remote_image"]
+        self.boot_remote_image = args_dict["boot_remote_image"]
+        self.detach_remote_image = args_dict["detach_remote_image"]
+        
+        # SRIOV operations
+        self.get_sriov = args_dict["get_sriov"]
+        self.enable_sriov = args_dict["enable_sriov"]
+        self.disable_sriov = args_dict["disable_sriov"]
+        
+        # BIOS operations
+        self.set_bios_attribute = args_dict["set_bios_attribute"]
+        self.get_bios_attribute = args_dict["get_bios_attribute"]
+        self.attribute = args_dict["attribute"]
+        self.value = args_dict["value"]
+        self.set_bios_password = args_dict["set_bios_password"]
+        self.remove_bios_password = args_dict["remove_bios_password"]
+        self.new_password = args_dict["new_password"]
+        self.old_password = args_dict["old_password"]
+        
+        # Screenshot
+        self.screenshot = args_dict["screenshot"]
+        
+        # SCP operations
+        self.get_scp_targets = args_dict["get_scp_targets"]
+        self.scp_targets = args_dict["scp_targets"]
+        self.scp_include_read_only = args_dict["scp_include_read_only"]
+        self.export_scp = args_dict["export_scp"]
+        self.import_scp = args_dict["import_scp"]
+        
+        # NIC operations
+        self.get_nic_fqdds = args_dict["get_nic_fqdds"]
+        self.get_nic_attribute = args_dict["get_nic_attribute"]
+        self.set_nic_attribute = args_dict["set_nic_attribute"]
+        
+        # Host identification
+        self.rack = args_dict["rack"]
+        self.uloc = args_dict["uloc"]
+        self.blade = args_dict["blade"]
+        
+        # Output and logging
+        self.output = args_dict["output"]
+        self.host_list = args_dict["host_list"]
 
 
-async def badfish_factory(_host, _username, _password, _logger=None, _retries=RETRIES, _loop=None):
-    if not _logger:
-        bfl = BadfishLogger()
-        _logger = bfl.logger
-
-    badfish = Badfish(_host, _username, _password, _logger, _retries, _loop)
-    await badfish.init()
-    return badfish
-
-
-class BadfishException(Exception):
-    pass
+class BadfishCommand:
+    """Base class for Badfish commands."""
+    
+    def __init__(self, config: BadfishConfig):
+        self.config = config
+    
+    async def execute(self, badfish) -> bool:
+        """Execute the command on the given badfish instance. Returns True if command was executed."""
+        raise NotImplementedError
 
 
-class Badfish:
-    def __init__(self, _host, _username, _password, _logger, _retries, _loop=None):
-        self.host = _host
-        self.username = _username
-        self.password = _password
-        self.retries = _retries
-        self.host_uri = "https://%s" % _host
-        self.redfish_uri = "/redfish/v1"
-        self.root_uri = "%s%s" % (self.host_uri, self.redfish_uri)
-        self.logger = _logger
-        self.semaphore = asyncio.Semaphore(50)
-        self.loop = _loop
-        if not self.loop:
-            self.loop = asyncio.get_event_loop()
-        self.system_resource = None
-        self.manager_resource = None
-        self.bios_uri = None
-        self.boot_devices = None
-        self.session_uri = None
-        self.session_id = None
-        self.token = None
-        self.vendor = None
+class BootCommand(BadfishCommand):
+    async def execute(self, badfish) -> bool:
+        if self.config.device:
+            await badfish.boot_to(self.config.device)
+            return True
+        elif self.config.boot_to_type:
+            await badfish.boot_to_type(self.config.boot_to_type, self.config.interfaces_path)
+            return True
+        elif self.config.boot_to_mac:
+            await badfish.boot_to_mac(self.config.boot_to_mac)
+            return True
+        elif self.config.check_boot:
+            await badfish.check_boot(self.config.interfaces_path)
+            return True
+        elif self.config.toggle_boot_device:
+            await badfish.toggle_boot_device(self.config.toggle_boot_device)
+            return True
+        elif self.config.host_type:
+            await badfish.change_boot(self.config.host_type, self.config.interfaces_path, self.config.pxe)
+            return True
+        return False
 
+
+class PowerCommand(BadfishCommand):
+    async def execute(self, badfish) -> bool:
+        if self.config.power_state:
+            state = await badfish.get_power_state()
+            badfish.logger.info("Power state:")
+            badfish.logger.info(f"    {badfish.host}: '{state}'")
+            return True
+        elif self.config.power_on:
+            await badfish.set_power_state("on")
+            return True
+        elif self.config.power_off:
+            await badfish.set_power_state("off")
+            return True
+        elif self.config.power_cycle:
+            await badfish.reboot_server(graceful=False)
+            return True
+        elif self.config.reboot_only:
+            await badfish.reboot_server()
+            return True
+        elif self.config.power_consumed_watts:
+            await badfish.get_power_consumed_watts()
+            return True
+        return False
+
+<<<<<<< Updated upstream
     async def __aenter__(self):
         await self.init()
         return self
@@ -85,902 +187,204 @@ class Badfish:
         self.system_resource = await self.find_systems_resource()
         self.manager_resource = await self.find_managers_resource()
         self.bios_uri = "%s/Bios/Settings" % self.system_resource[len(self.redfish_uri) :]
-
-    @staticmethod
-    def progress_bar(value, end_value, state, prompt="Host state", bar_length=20):
-        ratio = float(value) / end_value
-        arrow = "-" * int(round(ratio * bar_length) - 1) + ">"
-        spaces = " " * (bar_length - len(arrow))
-        percent = int(round(ratio * 100))
-
-        if state.lower() == "on":
-            state = "On  "
-        ret = "\r" if percent != 100 else "\n"
-        sys.stdout.write(f"\r- POLLING: [{arrow + spaces}] {percent}% - {prompt}: {state}{ret}")
-        sys.stdout.flush()
-
-    async def error_handler(self, _response, message=None):
-        try:
-            raw = await _response.text("utf-8", "ignore")
-            data = json.loads(raw.strip())
-        except ValueError:
-            raise BadfishException("Error reading response from host.")
-
-        detail_message = data
-        if "error" in data:
-            try:
-                detail_message = str(data["error"]["@Message.ExtendedInfo"][0]["Message"])
-                resolution = str(data["error"]["@Message.ExtendedInfo"][0]["Resolution"])
-                self.logger.debug(resolution)
-            except (KeyError, IndexError) as ex:
-                self.logger.debug(ex)
-        if message:
-            self.logger.debug(detail_message)
-            raise BadfishException(message)
-        else:
-            raise BadfishException(detail_message)
-
-    @alru_cache(maxsize=64)
-    async def get_request(self, uri, _continue=False, _get_token=False):
-        return await self.get_raw(uri, _continue, _get_token)
-
-    async def get_raw(self, uri, _continue=False, _get_token=False):
-        try:
-            async with self.semaphore:
-                async with aiohttp.ClientSession() as session:
-                    if not _get_token:
-                        async with session.get(
-                            uri,
-                            headers={"X-Auth-Token": self.token},
-                            ssl=False,
-                            timeout=60,
-                        ) as _response:
-                            await _response.read()
-                    else:
-                        async with session.get(
-                            uri,
-                            auth=aiohttp.BasicAuth(self.username, self.password),
-                            ssl=False,
-                            timeout=60,
-                        ) as _response:
-                            await _response.read()
-        except (Exception, TimeoutError) as ex:
-            if _continue:
-                return
-            else:
-                self.logger.debug(ex)
-                raise BadfishException("Failed to communicate with server.")
-        return _response
-
-    async def post_request(self, uri, payload, headers, _get_token=False):
-        try:
-            async with self.semaphore:
-                async with aiohttp.ClientSession() as session:
-                    if not _get_token:
-                        headers.update({"X-Auth-Token": self.token})
-                    async with session.post(
-                        uri,
-                        data=json.dumps(payload),
-                        headers=headers,
-                        ssl=False,
-                    ) as _response:
-                        if _response.status != 204:
-                            await _response.read()
-                        else:
-                            return _response
-        except (Exception, TimeoutError):
-            raise BadfishException("Failed to communicate with server.")
-        return _response
-
-    async def patch_request(self, uri, payload, headers, _continue=False):
-        try:
-            async with self.semaphore:
-                async with aiohttp.ClientSession() as session:
-                    headers.update({"X-Auth-Token": self.token})
-                    async with session.patch(
-                        uri,
-                        data=json.dumps(payload),
-                        headers=headers,
-                        ssl=False,
-                    ) as _response:
-                        await _response.read()
-        except Exception as ex:
-            if _continue:
-                return
-            else:
-                self.logger.debug(ex)
-                raise BadfishException("Failed to communicate with server.")
-        return _response
-
-    async def delete_request(self, uri, headers):
-        try:
-            async with self.semaphore:
-                async with aiohttp.ClientSession() as session:
-                    headers.update({"X-Auth-Token": self.token})
-                    async with session.delete(
-                        uri,
-                        headers=headers,
-                        ssl=False,
-                    ) as _response:
-                        await _response.read()
-        except (Exception, TimeoutError):
-            raise BadfishException("Failed to communicate with server.")
-        return _response
-
-    async def get_interfaces_by_type(self, host_type, _interfaces_path):
-        definitions = await self.read_yaml(_interfaces_path)
-
-        host_name_split = self.host.split(".")[0].split("-")
-        host_model = host_name_split[-1]
-        rack = host_name_split[1]
-        uloc = host_name_split[2]
-
-        host_blade = "000"
-        if len(host_name_split) > 4:
-            host_blade = host_name_split[3]
-
-        prefix = [host_type, rack, uloc, host_blade]
-
-        key = f"{host_type}_{host_blade}_{host_model}_interfaces"
-        interfaces_string = definitions.get(key)
-        if interfaces_string:
-            return interfaces_string.split(",")
-
-        len_prefix = len(prefix)
-        key = "None"
-        for _ in range(len_prefix):
-            prefix_string = "_".join(prefix)
-            key = "%s_%s_interfaces" % (prefix_string, host_model)
-            interfaces_string = definitions.get(key)
-            if interfaces_string:
-                return interfaces_string.split(",")
-            else:
-                prefix.pop()
-
-        raise BadfishException(f"Couldn't find a valid key defined on the interfaces yaml: {key}")
-
-    async def get_boot_seq(self):
-        bios_boot_mode = await self.get_bios_boot_mode()
-        if bios_boot_mode == "Uefi":
-            return "UefiBootSeq"
-        else:
-            return "BootSeq"
-
-    async def get_bios_boot_mode(self):
-        self.logger.debug("Getting bios boot mode.")
-        attribute = "BootMode"
-        bios_boot_mode = await self.get_bios_attribute(attribute)
-        if not bios_boot_mode:
-            self.logger.warning("Assuming boot mode is Bios.")
-            bios_boot_mode = "Bios"
-        self.logger.debug("Current boot mode: %s" % bios_boot_mode)
-        return bios_boot_mode
-
-    async def get_sriov_mode(self):
-        self.logger.debug("Getting global SRIOV mode.")
-        attribute = "SriovGlobalEnable"
-        sriov_mode = await self.get_bios_attribute(attribute)
-        return sriov_mode
-
-    async def get_bios_attributes_registry(self):
-        self.logger.debug("Getting BIOS attribute registry.")
-        _uri = "%s%s/Bios/BiosRegistry" % (self.host_uri, self.system_resource)
-        _response = await self.get_request(_uri)
-
-        if _response.status == 404:
-            self.logger.error("Operation not supported by vendor.")
-            return False
-
-        try:
-            raw = await _response.text("utf-8", "ignore")
-            data = json.loads(raw.strip())
-        except ValueError:
-            raise BadfishException("Could not retrieve Bios Attributes.")
-
-        return data
-
-    async def get_bios_attribute_registry(self, attribute):
-        data = await self.get_bios_attributes_registry()
-        attribute_value = await self.get_bios_attribute(attribute)
-        for entry in data["RegistryEntries"]["Attributes"]:
-            entries = [low_entry.lower() for low_entry in entry.values() if isinstance(low_entry, str)]
-            if attribute.lower() in entries:
-                for values in entry.items():
-                    if values[0] == "CurrentValue":
-                        self.logger.info(f"{values[0]}: {attribute_value}")
-                    else:
-                        self.logger.info(f"{values[0]}: {values[1]}")
-                return True
-        raise BadfishException(f"Unable to locate the Bios attribute: {attribute}")
-
-    async def get_bios_attributes(self):
-        self.logger.debug("Getting BIOS attributes.")
-        _uri = "%s%s/Bios" % (self.host_uri, self.system_resource)
-        _response = await self.get_request(_uri)
-
-        if _response.status == 404:
-            self.logger.error("Operation not supported by vendor.")
-            return False
-
-        try:
-            raw = await _response.text("utf-8", "ignore")
-            data = json.loads(raw.strip())
-        except ValueError:
-            raise BadfishException("Could not retrieve Bios Attributes.")
-        return data
-
-    async def get_bios_attribute(self, attribute):
-        data = await self.get_bios_attributes()
-        try:
-            bios_attribute = data["Attributes"][attribute]
-            return bios_attribute
-        except (KeyError, TypeError):
-            self.logger.warning("Could not retrieve Bios Attributes.")
-            return None
-
-    async def set_bios_attribute(self, attributes):
-        data = await self.get_bios_attributes_registry()
-        accepted = False
-        for entry in data["RegistryEntries"]["Attributes"]:
-            entries = [low_entry.lower() for low_entry in entry.values() if isinstance(low_entry, str)]
-            _warnings = []
-            _not_found = []
-            _remove = []
-            for attribute, value in attributes.items():
-                if attribute.lower() in entries:
-                    for values in entry.items():
-                        if values[0] == "Value":
-                            accepted_values = [value["ValueName"] for value in values[1]]
-                            for accepted_value in accepted_values:
-                                if value.lower() == accepted_value.lower():
-                                    value = accepted_value
-                                    accepted = True
-                            if not accepted:
-                                _warnings.append(f"List of accepted values for '{attribute}': {accepted_values}")
-
-                attribute_value = await self.get_bios_attribute(attribute)
-                if attribute_value:
-                    if value.lower() == attribute_value.lower():
-                        self.logger.warning(f"Attribute value for {attribute} is already in that state. IGNORING.")
-                        _remove.append(attribute)
-                else:
-                    _not_found.append(f"{attribute} not found. Please check attribute name.")
-            if _warnings:
-                for warning in _warnings:
-                    self.logger.warning(warning)
-                raise BadfishException("Value not accepted")
-            if _not_found:
-                for warning in _not_found:
-                    self.logger.error(warning)
-                raise BadfishException("Attribute not found")
-            if _remove:
-                for attribute in _remove:
-                    attributes.pop(attribute)
-
-        _payload = {"Attributes": attributes}
-
-        await self.patch_bios(_payload, insist=False)
-        await self.reboot_server()
-
-    async def get_boot_devices(self):
-        if not self.boot_devices:
-            _boot_seq = await self.get_boot_seq()
-            _uri = "%s%s/BootSources" % (self.host_uri, self.system_resource)
-            _response = await self.get_request(_uri)
-
-            if _response.status == 404:
-                self.logger.debug(_response.text)
-                raise BadfishException("Boot order modification is not supported by this host.")
-
-            raw = await _response.text("utf-8", "ignore")
-            data = json.loads(raw.strip())
-            if "Attributes" in data:
-                try:
-                    self.boot_devices = data["Attributes"][_boot_seq]
-                except KeyError:
-                    for key in data["Attributes"].keys():
-                        if "bootseq" in key.lower():
-                            self.logger.debug("Boot sequence found: %s" % key)
-                    raise BadfishException(
-                        "The boot mode does not match the boot sequence. Try again in a few minutes."
-                    )
-            else:
-                self.logger.debug(data)
-                raise BadfishException("Boot order modification is not supported by this host.")
-
-    async def get_job_queue(self):
-        self.logger.debug("Getting job queue.")
-        _url = "%s%s/Jobs" % (self.host_uri, self.manager_resource)
-        _response = await self.get_request(_url)
-
-        data = await _response.text("utf-8", "ignore")
-        job_queue = re.findall(r"[JR]ID_.+?\d+", data)
-        jobs = [job.strip("}").strip('"').strip("'") for job in job_queue]
-        return jobs
-
-    async def get_reset_types(self, manager=False, bmc=False):
-        if manager:
-            resource = self.manager_resource
-            endpoint = "#Manager.Reset"
-        else:
-            resource = self.system_resource
-            endpoint = "#ComputerSystem.Reset"
-
-        self.logger.debug("Getting allowable reset types.")
-        _url = "%s%s" % (self.host_uri, resource)
-        _response = await self.get_request(_url)
-        reset_types = []
-        if _response:
-            raw = await _response.text("utf-8", "ignore")
-            data = json.loads(raw.strip())
-            if "Actions" not in data:
-                self.logger.warning("Actions resource not found")
-            else:
-                reset = data["Actions"].get(endpoint)
-                if reset:
-                    reset_types = reset.get("ResetType@Redfish.AllowableValues", [])
-                    if not reset_types:
-                        if bmc:
-                            reset_types = ["GracefulRestart", "ForceRestart"]
-                        else:
-                            self.logger.warning("Could not get allowable reset types")
-        return reset_types
-
-    async def read_yaml(self, _yaml_file):
-        with open(_yaml_file, "r") as f:
-            try:
-                definitions = yaml.safe_load(f)
-            except yaml.YAMLError as ex:
-                self.logger.debug(ex)
-                raise BadfishException("Couldn't read file: %s" % _yaml_file)
-        return definitions
-
-    async def get_host_types_from_yaml(self, _interfaces_path):
-        definitions = await self.read_yaml(_interfaces_path)
-        host_types = set()
-        for line in definitions:
-            _split = line.split("_")
-            host_types.add(_split[0])
-
-        ordered_types = sorted(list(host_types))
-        return ordered_types
-
-    async def get_host_type(self, _interfaces_path):
-        await self.get_boot_devices()
-        if _interfaces_path:
-            host_types = await self.get_host_types_from_yaml(_interfaces_path)
-            for host_type in host_types:
-                match = True
-                interfaces = await self.get_interfaces_by_type(host_type, _interfaces_path)
-
-                for device in sorted(self.boot_devices[: len(interfaces)], key=lambda x: x["Index"]):
-                    if device["Name"] == interfaces[device["Index"]]:
-                        continue
-                    else:
-                        match = False
-                        break
-                if match:
-                    return host_type
-
-        return None
-
-    async def find_session_uri(self):
-        _response = await self.get_request(self.root_uri, _get_token=True)
-        raw = await _response.text("utf-8", "ignore")
-        data = json.loads(raw.strip())
-
-        status = _response.status
-        if status == 401:
-            raise BadfishException(f"Failed to authenticate. Verify your credentials for {self.host}")
-        if status not in [200, 201]:
-            raise BadfishException(f"Failed to communicate with {self.host}")
-
-        redfish_version = int(data["RedfishVersion"].replace(".", ""))
-        session_uri = None
-        if redfish_version >= 160:
-            session_uri = "/redfish/v1/SessionService/Sessions"
-        elif redfish_version < 160:
-            session_uri = "/redfish/v1/Sessions"
-
-        _uri = "%s%s" % (self.host_uri, session_uri)
-        check_response = await self.get_request(_uri, _get_token=True)
-        if check_response.status == 404:
-            session_uri = "/redfish/v1/SessionService/Sessions"
-
-        return session_uri
-
-    async def validate_credentials(self):
-        payload = {"UserName": self.username, "Password": self.password}
-        headers = {"content-type": "application/json"}
-        _uri = "%s%s" % (self.host_uri, self.session_uri)
-        _response = await self.post_request(_uri, headers=headers, payload=payload, _get_token=True)
-
-        # Mock shifting value on value access and not on call.
-        await _response.text("utf-8", "ignore")
-
-        status = _response.status
-        if status == 401:
-            raise BadfishException(f"Failed to authenticate. Verify your credentials for {self.host}")
-        if status not in [200, 201]:
-            raise BadfishException(f"Failed to communicate with {self.host}")
-
-        self.session_id = _response.headers.get("Location")
-        return _response.headers.get("X-Auth-Token")
-
-    async def get_interfaces_endpoints(self):
-        _uri = "%s%s/EthernetInterfaces" % (self.host_uri, self.system_resource)
-        _response = await self.get_request(_uri)
-
-        raw = await _response.text("utf-8", "ignore")
-        data = json.loads(raw.strip())
-
-        if _response.status == 404:
-            self.logger.debug(raw)
-            raise BadfishException("EthernetInterfaces entry point not supported by this host.")
-
-        endpoints = []
-        if data.get("Members"):
-            for member in data["Members"]:
-                endpoints.append(member["@odata.id"])
-        else:
-            raise BadfishException("EthernetInterfaces's Members array is either empty or missing")
-
-        return endpoints
-
-    async def get_interface(self, endpoint):
-        _uri = "%s%s" % (self.host_uri, endpoint)
-        _response = await self.get_request(_uri)
-
-        raw = await _response.text("utf-8", "ignore")
-
-        if _response.status == 404:
-            self.logger.debug(raw)
-            raise BadfishException("EthernetInterface entry point not supported by this host.")
-
-        data = json.loads(raw.strip())
-
-        return data
-
-    async def find_systems_resource(self):
-        response = await self.get_request(self.root_uri)
-        if response:
-            if response.status == 401:
-                raise BadfishException("Failed to authenticate. Verify your credentials.")
-
-            raw = await response.text("utf-8", "ignore")
-            data = json.loads(raw.strip())
-            if "Systems" not in data:
-                raise BadfishException("Systems resource not found")
-            else:
-                systems = data["Systems"]["@odata.id"]
-                _response = await self.get_request(self.host_uri + systems)
-                if _response.status == 401:
-                    raise BadfishException("Authorization Error: verify credentials.")
-
-                raw = await _response.text("utf-8", "ignore")
-                data = json.loads(raw.strip())
-                if data.get("Members"):
-                    for member in data["Members"]:
-                        systems_service = member["@odata.id"]
-                        self.logger.debug("Systems service: %s." % systems_service)
-                        return systems_service
-                else:
-                    await self.error_handler(
-                        _response,
-                        message="ComputerSystem's Members array is either empty or missing",
-                    )
-        else:
-            raise BadfishException("Failed to communicate with server.")
-
-    async def find_managers_resource(self):
-        response = await self.get_request(self.root_uri)
-        if response:
-            raw = await response.text("utf-8", "ignore")
-            data = json.loads(raw.strip())
-
-            self.vendor = "Dell" if "Dell" in data["Oem"] else "Supermicro"
-
-            if "Managers" not in data:
-                raise BadfishException("Managers resource not found")
-            else:
-                managers = data["Managers"]["@odata.id"]
-                response = await self.get_request(self.host_uri + managers)
-                if response and response.status in [200, 201]:
-                    raw = await response.text("utf-8", "ignore")
-                    data = json.loads(raw.strip())
-                    if data.get("Members"):
-                        for member in data["Members"]:
-                            managers_service = member["@odata.id"]
-                            self.logger.debug("Managers service: %s." % managers_service)
-                            return managers_service
-                    else:
-                        raise BadfishException("Manager's Members array is either empty or missing")
-
-    async def get_power_state(self):
-        _uri = "%s%s" % (self.host_uri, self.system_resource)
-        self.logger.debug("url: %s" % _uri)
-
-        _response = await self.get_request(_uri, _continue=True)
-        if not _response:
-            return "Down"
-        if _response.status == 200:
-            raw = await _response.text("utf-8", "ignore")
-            data = json.loads(raw.strip())
-        else:
-            self.logger.debug("Couldn't get power state. Retrying.")
-            return "Down"
-
-        if not data.get("PowerState"):
-            raise BadfishException("Power state not found. Try to racreset.")
-        else:
-            self.logger.debug("Current server power state is: %s." % data["PowerState"])
-
-        return data["PowerState"]
-
-    async def set_power_state(self, state):
-        if state.lower() not in ["on", "off"]:
-            raise BadfishException("Power state not valid. 'on' or 'off' only accepted.")
-
-        _uri = "%s%s" % (self.host_uri, self.system_resource)
-        self.logger.debug("url: %s" % _uri)
-
-        _response = await self.get_request(_uri, _continue=True)
-        if not _response and state.lower() == "off":
-            self.logger.warning("Power state appears to be already set to 'off'.")
-            return
-
-        status = _response.status
-        if status == 200:
-            raw = await _response.text("utf-8", "ignore")
-            data = json.loads(raw.strip())
-        else:
-            raise BadfishException("Couldn't get power state.")
-
-        if not data.get("PowerState"):
-            raise BadfishException("Power state not found. Try to racreset.")
-        else:
-            self.logger.debug("Current server power state is: %s." % data["PowerState"])
-
-        if state.lower() == "off":
-            await self.send_reset("ForceOff")
-        elif state.lower() == "on":
-            await self.send_reset("On")
-
-        return data["PowerState"]
-
-    async def get_power_consumed_watts(self):
-        _uri = "%s%s/Chassis/%s/Power" % (self.host_uri, self.redfish_uri, self.system_resource.split("/")[-1])
-        _response = await self.get_request(_uri)
-
-        if _response.status == 404:
-            self.logger.error("Operation not supported by vendor.")
-            return False
-        try:
-            raw = await _response.text("utf-8", "ignore")
-            data = json.loads(raw.strip())
-        except ValueError:
-            raise BadfishException("Power value outside operating range.")
-        try:
-            cwc = data["PowerControl"][0]["PowerConsumedWatts"]
-        except IndexError:
-            cwc = "N/A. Try to `--racreset`."
-        self.logger.info(f"Current watts consumed: {cwc}")
-        return
-
-    async def change_boot(self, host_type, interfaces_path, pxe=False):
-        if interfaces_path:
-            if not os.path.exists(interfaces_path):
-                raise BadfishException("No such file or directory: '%s'." % interfaces_path)
-            host_types = await self.get_host_types_from_yaml(interfaces_path)
-            if host_type.lower() not in host_types:
-                raise BadfishException(f"Expected values for -t argument are: {host_types}")
-        else:
-            raise BadfishException("You must provide a path to the interfaces yaml via `-i` optional argument.")
-        _type = None
-        if host_type.lower() != "uefi":
-            _type = await self.get_host_type(interfaces_path)
-        if (_type and _type.lower() != host_type.lower()) or not _type:
-            await self.clear_job_queue()
-            if host_type.lower() == "uefi":
-                payload = dict()
-                boot_mode = await self.get_bios_boot_mode()
-                if boot_mode.lower() != "uefi":
-                    payload["BootMode"] = "Uefi"
-                interfaces = await self.get_interfaces_by_type(host_type, interfaces_path)
-
-                for i, interface in enumerate(interfaces, 1):
-                    payload[f"PxeDev{i}Interface"] = interface
-                    payload[f"PxeDev{i}EnDis"] = "Enabled"
-
-                await self.set_bios_attribute(payload)
-
-            else:
-                boot_mode = await self.get_bios_boot_mode()
-                if boot_mode.lower() == "uefi":
-                    self.logger.warning(
-                        "Changes being requested will be valid for Bios BootMode. " "Current boot mode is set to Uefi."
-                    )
-                await self.change_boot_order(host_type, interfaces_path)
-
-                if pxe:
-                    await self.set_next_boot_pxe()
-
-                await self.create_bios_config_job(self.bios_uri)
-
-                await self.reboot_server(graceful=False)
-
-        else:
-            self.logger.warning("No changes were made since the boot order already matches the requested.")
-        return True
-
-    async def change_boot_order(self, _host_type, _interfaces_path):
-        interfaces = await self.get_interfaces_by_type(_host_type, _interfaces_path)
-
-        await self.get_boot_devices()
-        devices = [device["Name"] for device in self.boot_devices]
-        valid_devices = [device for device in interfaces if device in devices]
-        if len(valid_devices) < len(interfaces):
-            diff = [device for device in interfaces if device not in valid_devices]
-            self.logger.warning("Some interfaces are not valid boot devices. Ignoring: %s" % ", ".join(diff))
-        change = False
-        ordered_devices = self.boot_devices.copy()
-        for i, interface in enumerate(valid_devices):
-            for device in ordered_devices:
-                if interface == device["Name"]:
-                    if device["Index"] != i:
-                        device["Index"] = i
-                        change = True
-                    break
-
-        if change:
-            await self.patch_boot_seq(ordered_devices)
-        else:
-            self.logger.warning("No changes were made since the boot order already matches the requested.")
-
-    async def patch_boot_seq(self, ordered_devices):
-        _boot_seq = await self.get_boot_seq()
-        boot_sources_uri = "%s/BootSources/Settings" % self.system_resource
-        url = "%s%s" % (self.host_uri, boot_sources_uri)
-        payload = {"Attributes": {_boot_seq: ordered_devices}}
-        headers = {"content-type": "application/json"}
-        response = None
-        _status_code = 400
-
-        for _ in range(self.retries):
-            if _status_code != 200:
-                response = await self.patch_request(url, payload, headers, True)
-                if response:
-                    raw = await response.text("utf-8", "ignore")
-                    self.logger.debug(raw)
-                    _status_code = response.status
-            else:
-                break
-
-        if _status_code == 200:
-            self.logger.debug("PATCH command passed to update boot order.")
-        else:
-            self.logger.error("There was something wrong with your request.")
-
-            if response:
-                await self.error_handler(response)
-
-    async def set_next_boot_pxe(self):
-        _url = "%s%s" % (self.host_uri, self.system_resource)
-        _payload = {
-            "Boot": {
-                "BootSourceOverrideTarget": "Pxe",
-                "BootSourceOverrideEnabled": "Once",
-            }
-        }
-        _headers = {"content-type": "application/json"}
-        _response = await self.patch_request(_url, _payload, _headers)
-
-        await asyncio.sleep(5)
-
-        if _response.status == 200:
-            self.logger.info('PATCH command passed to set next boot onetime boot device to: "%s".' % "Pxe")
-        else:
-            self.logger.error("Command failed, error code is %s." % _response.status)
-
-            await self.error_handler(_response)
-
-    async def check_supported_idrac_version(self):
-        _url = "%s/Dell/Managers/iDRAC.Embedded.1/DellJobService/" % self.root_uri
-        _response = await self.get_request(_url)
-        if _response.status != 200:
-            self.logger.warning("iDRAC version installed does not support DellJobService")
-            return False
-
-        return True
-
-    async def check_supported_network_interfaces(self, endpoint):
-        _url = "%s%s/%s" % (self.host_uri, self.system_resource, endpoint)
-        _response = await self.get_request(_url)
-        if _response.status != 200:
-            return False
-
-        return True
-
-    async def delete_job_queue_dell(self, force):
-        _url = "%s/Dell/Managers/iDRAC.Embedded.1/DellJobService/Actions/DellJobService.DeleteJobQueue" % self.root_uri
-        job_id = "JID_CLEARALL"
-        if force:
-            job_id = f"{job_id}_FORCE"
-        _payload = {"JobID": job_id}
-        _headers = {"content-type": "application/json"}
-        response = await self.post_request(_url, _payload, _headers)
-        if response.status == 200:
-            self.logger.info("Job queue for iDRAC %s successfully cleared." % self.host)
-        else:
-            await self.error_handler(
-                response,
-                message="Job queue not cleared, there was something wrong with your request.",
-            )
-
-    async def delete_job_queue_force(self):
-        _url = "%s%s/Jobs" % (self.host_uri, self.manager_resource)
-        _headers = {"content-type": "application/json"}
-        url = "%s/JID_CLEARALL_FORCE" % _url
-        try:
-            _response = await self.delete_request(url, _headers)
-            if _response.status in [200, 204]:
-                self.logger.info("Job queue for iDRAC %s successfully cleared." % self.host)
-        except BadfishException as ex:
-            self.logger.debug(ex)
-            raise BadfishException("There was something wrong clearing the job queue.")
-        return _response
-
-    async def clear_job_list(self, _job_queue):
-        _url = "%s%s/Jobs" % (self.host_uri, self.manager_resource)
-        _headers = {"content-type": "application/json"}
-        self.logger.warning("Clearing job queue for job IDs: %s." % _job_queue)
-        for _job in _job_queue:
-            job = _job.strip("'")
-            url = "/".join([_url, job])
-            response = await self.delete_request(url, _headers)
-            if response.status != 200:
-                raise BadfishException("Job queue not cleared, there was something wrong with your request.")
-
-        self.logger.info("Job queue for iDRAC %s successfully cleared." % self.host)
-        return True
-
-    async def clear_job_queue(self, force=False):
-        _job_queue = await self.get_job_queue()
-        if _job_queue or force:
-            supported = await self.check_supported_idrac_version()
-            if supported:
-                await self.delete_job_queue_dell(force)
-            else:
-                try:
-                    _response = await self.delete_job_queue_force()
-                    if _response.status == 400:
-                        await self.clear_job_list(_job_queue)
-                except BadfishException:
-                    self.logger.info("Attempting to clear job list instead.")
-                    await self.clear_job_list(_job_queue)
-        else:
-            self.logger.warning("Job queue already cleared for iDRAC %s, DELETE command will not execute." % self.host)
-
-    async def list_job_queue(self):
-        _job_queue = await self.get_job_queue()
-        if _job_queue:
-            self.logger.info("Found active jobs:")
-            for job in _job_queue:
-                self.logger.info("    JobID: " + job)
-        else:
-            self.logger.info("Found active jobs: None")
-
-    async def create_job(self, _url, _payload, _headers, expected=None):
-        if not expected:
-            expected = [200, 204]
-        _response = await self.post_request(_url, _payload, _headers)
-
-        status_code = _response.status
-        if status_code in expected:
-            self.logger.debug("POST command passed to create target config job.")
-        else:
-            self.logger.error("POST command failed to create BIOS config job, status code is %s." % status_code)
-
-            await self.error_handler(_response)
-
-        raw = await _response.text("utf-8", "ignore")
-        result = re.search("JID_.+?", raw)
-        res_group = ""
-        if result:
-            res_group = result.group()
-        job_id = re.sub("[,']", "", res_group)
-        if job_id:
-            self.logger.debug("%s job ID successfully created" % job_id)
-        return job_id
-
-    async def create_bios_config_job(self, uri):
-        _url = "%s%s/Jobs" % (self.host_uri, self.manager_resource)
-        _payload = {"TargetSettingsURI": "%s%s" % (self.redfish_uri, uri)}
-        _headers = {"content-type": "application/json"}
-        return await self.create_job(_url, _payload, _headers)
-
-    async def check_schedule_job_status(self, job_id):
-        _url = f"{self.host_uri}{self.manager_resource}/Jobs/{job_id}"
-        _response = await self.get_request(_url)
-
-        if _response:
-            status_code = _response.status
-            raw = await _response.text("utf-8", "ignore")
-            data = json.loads(raw.strip())
-
-            if status_code == 200:
-                await asyncio.sleep(10)
-            else:
-                self.logger.error(f"Command failed to check job status, return code is {status_code}")
-                self.logger.debug(f"Extended Info Message: {data}")
-                return False
-
-            self.logger.info(f"JobID: {data[u'Id']}")
-            self.logger.info(f"Name: {data[u'Name']}")
-            self.logger.info(f"Message: {data[u'Message']}")
-            self.logger.info(f"PercentComplete: {str(data[u'PercentComplete'])}")
-        else:
-            self.logger.error("Command failed to check job status")
-            return False
-
-    async def check_job_status(self, job_id):
-        for count in range(self.retries):
-            _url = f"{self.host_uri}{self.manager_resource}/Jobs/{job_id}"
-            self.get_request.cache_clear()
-            _response = await self.get_request(_url)
-
-            status_code = _response.status
-            raw = await _response.text("utf-8", "ignore")
-            data = json.loads(raw.strip())
-            if status_code == 200:
-                pass
-            else:
-                self.logger.error(f"Command failed to check job status, return code is {status_code}")
-                self.logger.debug(f"Extended Info Message: {data}")
-                return False
-            if "Fail" in data["Message"] or "fail" in data["Message"]:
-                self.logger.debug(f"\n{job_id} job failed.")
-                return False
-            elif data["Message"] == "Job completed successfully.":
-                self.logger.info(f"JobID: {data[u'Id']}")
-                self.logger.info(f"Name: {data[u'Name']}")
-                self.logger.info(f"Message: {data[u'Message']}")
-                self.logger.info(f"PercentComplete: {str(data[u'PercentComplete'])}")
-                break
-            else:
-                self.progress_bar(count, self.retries, data["Message"], prompt="Status")
-                await asyncio.sleep(30)
-
-    async def send_reset(self, reset_type):
-        _url = "%s%s/Actions/ComputerSystem.Reset" % (
-            self.host_uri,
-            self.system_resource,
-        )
-        _payload = {"ResetType": reset_type}
-        _headers = {"content-type": "application/json"}
-        _response = await self.post_request(_url, _payload, _headers)
-
-        status_code = _response.status
-        if status_code in [200, 204]:
-            self.logger.info("Command passed to %s server, code return is %s." % (reset_type, status_code))
-            await asyncio.sleep(10)
+=======
+>>>>>>> Stashed changes
+
+class ResetCommand(BadfishCommand):
+    async def execute(self, badfish) -> bool:
+        if self.config.rac_reset:
+            await badfish.reset_idrac()
             return True
-        elif status_code == 409:
-            self.logger.warning("Command failed to %s server, host appears to be already in that state." % reset_type)
-        else:
-            self.logger.error("Command failed to %s server, status code is: %s." % (reset_type, status_code))
-
-            await self.error_handler(_response)
+        elif self.config.bmc_reset:
+            await badfish.reset_bmc()
+            return True
+        elif self.config.factory_reset:
+            await badfish.reset_bios()
+            return True
         return False
 
-    async def reboot_server(self, graceful=True):
-        _reset_types = await self.get_reset_types()
-        reset_type = "GracefulRestart"
-        if reset_type not in _reset_types:
-            for rt in _reset_types:
-                if "restart" in rt.lower():
-                    reset_type = rt
 
+class JobCommand(BadfishCommand):
+    async def execute(self, badfish) -> bool:
+        if self.config.clear_jobs:
+            await badfish.clear_job_queue(self.config.force)
+            return True
+        elif self.config.check_job:
+            await badfish.check_schedule_job_status(self.config.check_job)
+            return True
+        elif self.config.list_jobs:
+            await badfish.list_job_queue()
+            return True
+        return False
+
+
+class InventoryCommand(BadfishCommand):
+    async def execute(self, badfish) -> bool:
+        if self.config.firmware_inventory:
+            await badfish.get_firmware_inventory()
+            return True
+        elif self.config.list_interfaces:
+            await badfish.list_interfaces()
+            return True
+        elif self.config.list_processors:
+            await badfish.list_processors()
+            return True
+        elif self.config.list_gpu:
+            await badfish.list_gpu()
+            return True
+        elif self.config.list_memory:
+            await badfish.list_memory()
+            return True
+        elif self.config.list_serial:
+            await badfish.list_serial()
+            return True
+        return False
+
+
+class VirtualMediaCommand(BadfishCommand):
+    async def execute(self, badfish) -> bool:
+        if self.config.check_virtual_media:
+            await badfish.check_virtual_media()
+            return True
+        elif self.config.mount_virtual_media:
+            await badfish.mount_virtual_media(self.config.mount_virtual_media)
+            return True
+        elif self.config.unmount_virtual_media:
+            await badfish.unmount_virtual_media()
+            return True
+        elif self.config.boot_to_virtual_media:
+            await badfish.boot_to_virtual_media()
+            return True
+        return False
+
+
+class RemoteImageCommand(BadfishCommand):
+    async def execute(self, badfish) -> bool:
+        if self.config.check_remote_image:
+            await badfish.check_remote_image()
+            return True
+        elif self.config.boot_remote_image:
+            await badfish.boot_remote_image(self.config.boot_remote_image)
+            return True
+        elif self.config.detach_remote_image:
+            await badfish.detach_remote_image()
+            return True
+        return False
+
+
+class SRIOVCommand(BadfishCommand):
+    async def execute(self, badfish) -> bool:
+        if self.config.get_sriov:
+            sriov_mode = await badfish.get_sriov_mode()
+            if sriov_mode:
+                badfish.logger.info(sriov_mode)
+            return True
+        elif self.config.enable_sriov:
+            await badfish.send_sriov_mode(True)
+            return True
+        elif self.config.disable_sriov:
+            await badfish.send_sriov_mode(False)
+            return True
+        return False
+
+
+class BIOSCommand(BadfishCommand):
+    async def execute(self, badfish) -> bool:
+        if self.config.get_bios_attribute:
+            if self.config.attribute:
+                await badfish.get_bios_attribute_registry(self.config.attribute)
+            else:
+                data = await badfish.get_bios_attributes()
+                for attribute, value in data["Attributes"].items():
+                    badfish.logger.info(f"{attribute}: {value}")
+            return True
+        elif self.config.set_bios_attribute:
+            payload = {self.config.attribute: self.config.value}
+            await badfish.set_bios_attribute(payload)
+            return True
+        elif self.config.set_bios_password:
+            await badfish.set_bios_password(self.config.old_password, self.config.new_password)
+            return True
+        elif self.config.remove_bios_password:
+            await badfish.remove_bios_password(self.config.old_password)
+            return True
+        return False
+
+
+class ScreenshotCommand(BadfishCommand):
+    async def execute(self, badfish) -> bool:
+        if self.config.screenshot:
+            await badfish.take_screenshot()
+            return True
+        return False
+
+
+class SCPCommand(BadfishCommand):
+    async def execute(self, badfish) -> bool:
+        if self.config.get_scp_targets:
+            await badfish.get_scp_targets(self.config.get_scp_targets)
+            return True
+        elif self.config.export_scp:
+            await badfish.export_scp(self.config.export_scp, self.config.scp_targets, self.config.scp_include_read_only)
+            return True
+        elif self.config.import_scp:
+            await badfish.import_scp(self.config.import_scp, self.config.scp_targets)
+            return True
+        return False
+
+
+class NICCommand(BadfishCommand):
+    async def execute(self, badfish) -> bool:
+        if self.config.get_nic_fqdds:
+            await badfish.get_nic_fqdds()
+            return True
+        elif self.config.get_nic_attribute:
+            if self.config.attribute:
+                await badfish.get_nic_attribute_info(self.config.get_nic_attribute, self.config.attribute)
+            else:
+                await badfish.get_nic_attribute(self.config.get_nic_attribute)
+            return True
+        elif self.config.set_nic_attribute:
+            await badfish.set_nic_attribute(self.config.set_nic_attribute, self.config.attribute, self.config.value)
+            return True
+        return False
+
+
+class BadfishCommandExecutor:
+    """Executes commands on a Badfish instance."""
+    
+    def __init__(self, config: BadfishConfig):
+        self.config = config
+        self.commands = [
+            BootCommand(config),
+            PowerCommand(config),
+            ResetCommand(config),
+            JobCommand(config),
+            InventoryCommand(config),
+            VirtualMediaCommand(config),
+            RemoteImageCommand(config),
+            SRIOVCommand(config),
+            BIOSCommand(config),
+            ScreenshotCommand(config),
+            SCPCommand(config),
+            NICCommand(config),
+        ]
+    
+    async def execute(self, badfish) -> bool:
+        """Execute the first matching command. Returns True if any command was executed."""
+        for command in self.commands:
+            if await command.execute(badfish):
+                return True
+        
+        # Handle PXE boot if no other boot command was executed
+        if self.config.pxe and not self.config.host_type:
+            await badfish.set_next_boot_pxe()
+            return True
+        
+        return False
+
+
+<<<<<<< Updated upstream
         self.logger.debug("Rebooting server: %s." % self.host)
         power_state = await self.get_power_state()
         if power_state.lower() == "on":
@@ -2590,128 +1994,40 @@ async def execute_badfish(_host, _args, logger, format_handler=None):
     get_nic_fqdds = _args["get_nic_fqdds"]
     get_nic_attribute = _args["get_nic_attribute"]
     set_nic_attribute = _args["set_nic_attribute"]
+=======
+async def execute_badfish(_host: str, _args: Dict[str, Any], logger, format_handler=None) -> tuple[str, bool]:
+    """Execute Badfish operations on a single host."""
+    config = BadfishConfig(_args)
+>>>>>>> Stashed changes
     result = True
     badfish = None
 
     try:
         badfish = await badfish_factory(
             _host=_host,
-            _username=_username,
-            _password=_password,
+            _username=config.username,
+            _password=config.password,
             _logger=logger,
-            _retries=retries,
+            _retries=config.retries,
         )
 
-        if _args["host_list"] and not _args["output"]:
-            badfish.logger.info("Executing actions on host: %s" % _host)
+        if config.host_list and not config.output:
+            logger.info("Executing actions on host: %s" % _host)
 
-        if device:
-            await badfish.boot_to(device)
-        elif boot_to_type:
-            await badfish.boot_to_type(boot_to_type, interfaces_path)
-        elif boot_to_mac:
-            await badfish.boot_to_mac(boot_to_mac)
-        elif check_boot:
-            await badfish.check_boot(interfaces_path)
-        elif toggle_boot_device:
-            await badfish.toggle_boot_device(toggle_boot_device)
-        elif firmware_inventory:
-            await badfish.get_firmware_inventory()
-        elif clear_jobs:
-            await badfish.clear_job_queue(force)
-        elif check_job:
-            await badfish.check_schedule_job_status(check_job)
-        elif list_jobs:
-            await badfish.list_job_queue()
-        elif host_type:
-            await badfish.change_boot(host_type, interfaces_path, pxe)
-        elif rac_reset:
-            await badfish.reset_idrac()
-        elif bmc_reset:
-            await badfish.reset_bmc()
-        elif factory_reset:
-            await badfish.reset_bios()
-        elif power_state:
-            state = await badfish.get_power_state()
-            logger.info("Power state:")
-            logger.info(f"    {_host}: '{state}'")
-        elif power_on:
-            await badfish.set_power_state("on")
-        elif power_off:
-            await badfish.set_power_state("off")
-        elif power_cycle:
-            await badfish.reboot_server(graceful=False)
-        elif reboot_only:
-            await badfish.reboot_server()
-        elif power_consumed_watts:
-            await badfish.get_power_consumed_watts()
-        elif list_interfaces:
-            await badfish.list_interfaces()
-        elif list_processors:
-            await badfish.list_processors()
-        elif list_gpu:
-            await badfish.list_gpu()
-        elif list_memory:
-            await badfish.list_memory()
-        elif list_serial:
-            await badfish.list_serial()
-        elif check_virtual_media:
-            await badfish.check_virtual_media()
-        elif mount_virtual_media:
-            await badfish.mount_virtual_media(mount_virtual_media)
-        elif unmount_virtual_media:
-            await badfish.unmount_virtual_media()
-        elif boot_to_virtual_media:
-            await badfish.boot_to_virtual_media()
-        elif check_remote_image:
-            await badfish.check_remote_image()
-        elif boot_remote_image:
-            await badfish.boot_remote_image(boot_remote_image)
-        elif detach_remote_image:
-            await badfish.detach_remote_image()
-        elif get_sriov:
-            sriov_mode = await badfish.get_sriov_mode()
-            if sriov_mode:
-                logger.info(sriov_mode)
-        elif enable_sriov:
-            await badfish.send_sriov_mode(True)
-        elif disable_sriov:
-            await badfish.send_sriov_mode(False)
-        elif get_bios_attribute:
-            if attribute:
-                await badfish.get_bios_attribute_registry(attribute)
-            else:
-                data = await badfish.get_bios_attributes()
-                for attribute, value in data["Attributes"].items():
-                    logger.info(f"{attribute}: {value}")
-        elif set_bios_attribute:
-            payload = {attribute: value}
-            await badfish.set_bios_attribute(payload)
-        elif set_bios_password:
-            await badfish.set_bios_password(old_password, new_password)
-        elif remove_bios_password:
-            await badfish.remove_bios_password(old_password)
-        elif screenshot:
-            await badfish.take_screenshot()
-        elif get_scp_targets:
-            await badfish.get_scp_targets(get_scp_targets)
-        elif export_scp:
-            await badfish.export_scp(export_scp, scp_targets, scp_include_read_only)
-        elif import_scp:
-            await badfish.import_scp(import_scp, scp_targets)
-        elif get_nic_fqdds:
-            await badfish.get_nic_fqdds()
-        elif get_nic_attribute:
-            if attribute:
-                await badfish.get_nic_attribute_info(get_nic_attribute, attribute)
-            else:
-                await badfish.get_nic_attribute(get_nic_attribute)
-        elif set_nic_attribute:
-            await badfish.set_nic_attribute(set_nic_attribute, attribute, value)
+        # Use command pattern to execute operations
+        executor = BadfishCommandExecutor(config)
+        command_executed = await executor.execute(badfish)
+        
+        if not command_executed:
+            # No command was executed, this might be an error or no-op
+            logger.warning("No operation specified or no matching command found")
 
+<<<<<<< Updated upstream
         if pxe and not host_type:
             await badfish.set_next_boot_pxe()
 
+=======
+>>>>>>> Stashed changes
     except BadfishException as ex:
         logger.error(ex)
         result = False
@@ -2723,24 +2039,27 @@ async def execute_badfish(_host, _args, logger, format_handler=None):
             except BadfishException as ex:
                 logger.warning(f"Failed to close session for {_host}: {ex}")
 
-    if _args["host_list"]:
+    if config.host_list:
         logger.info("*" * 48)
-        if output and result:
+        if config.output and result:
             format_handler.host = _host
             format_handler.parse()
     else:
-        if output and result:
+        if config.output and result:
             format_handler.parse()
 
     return _host, result
 
 
-def main(argv=None):
+def create_argument_parser() -> argparse.ArgumentParser:
+    """Create and configure the argument parser."""
     parser = argparse.ArgumentParser(
         prog="badfish",
         description="Tool for managing server hardware via the Redfish API.",
         allow_abbrev=False,
     )
+    
+    # Core arguments
     parser.add_argument("-H", "--host", help="iDRAC host address")
     parser.add_argument("-u", help="iDRAC username", required=True)
     parser.add_argument("-p", help="iDRAC password", required=True)
@@ -2748,368 +2067,275 @@ def main(argv=None):
     parser.add_argument("-t", help="Type of host as defined on iDRAC interfaces yaml")
     parser.add_argument("-l", "--log", help="Optional argument for logging results to a file")
     parser.add_argument(
-        "-o",
-        "--output",
-        choices=["json", "yaml"],
+        "-o", "--output", choices=["json", "yaml"],
         help="Optional argument for choosing a special output format (json/yaml), otherwise our normal format is used.",
     )
     parser.add_argument(
-        "-f",
-        "--force",
-        dest="force",
-        action="store_true",
+        "-f", "--force", dest="force", action="store_true",
         help="Optional argument for forced clear-jobs",
     )
     parser.add_argument(
-        "--host-list",
-        help="Path to a plain text file with a list of hosts",
-        default=None,
-    )
-    parser.add_argument("--pxe", help="Set next boot to one-shot boot PXE", action="store_true")
-    parser.add_argument("--boot-to", help="Set next boot to one-shot boot to a specific device")
-    parser.add_argument(
-        "--boot-to-type",
-        help="Set next boot to one-shot boot to a specific type as defined on iDRAC interfaces yaml",
-    )
-    parser.add_argument(
-        "--boot-to-mac",
-        help="Set next boot to one-shot boot to a specific MAC address on the target",
-    )
-    parser.add_argument("--reboot-only", help="Flag for only rebooting the host", action="store_true")
-    parser.add_argument(
-        "--power-cycle",
-        help="Flag for sending ForceOff instruction to the host",
-        action="store_true",
-    )
-    parser.add_argument(
-        "--power-state",
-        help="Get power state",
-        action="store_true",
-    )
-    parser.add_argument(
-        "--power-on",
-        help="Power on host",
-        action="store_true",
-    )
-    parser.add_argument(
-        "--power-off",
-        help="Power off host",
-        action="store_true",
-    )
-    parser.add_argument(
-        "--get-power-consumed",
-        help="Get current consumed watts on host(s)",
-        action="store_true",
-    )
-    parser.add_argument("--racreset", help="Flag for iDRAC reset", action="store_true")
-    parser.add_argument("--bmc-reset", help="Flag for BMC reset", action="store_true")
-    parser.add_argument(
-        "--factory-reset",
-        help="Reset BIOS to default factory settings",
-        action="store_true",
-    )
-    parser.add_argument(
-        "--check-boot",
-        help="Flag for checking the host boot order",
-        action="store_true",
-    )
-    parser.add_argument(
-        "--toggle-boot-device",
-        help="Change the enabled status of a boot device",
-        default="",
-    )
-    parser.add_argument(
-        "--firmware-inventory",
-        help="Get firmware inventory",
-        action="store_true",
-    )
-    parser.add_argument(
-        "--delta",
-        help="Address of the other host between which the delta should be made",
-        default="",
-    )
-    parser.add_argument(
-        "--clear-jobs",
-        help="Clear any scheduled jobs from the queue",
-        action="store_true",
-    )
-    parser.add_argument(
-        "--check-job",
-        help="Check a job status and details",
-    )
-    parser.add_argument(
-        "--ls-jobs",
-        help="List any scheduled jobs in queue",
-        action="store_true",
-    )
-    parser.add_argument(
-        "--ls-interfaces",
-        help="List Network interfaces",
-        action="store_true",
-    )
-    parser.add_argument(
-        "--ls-processors",
-        help="List Processor Summary",
-        action="store_true",
-    )
-    parser.add_argument(
-        "--ls-gpu",
-        help="List GPU's on host",
-        action="store_true",
-    )
-    parser.add_argument(
-        "--ls-memory",
-        help="List Memory Summary",
-        action="store_true",
-    )
-    parser.add_argument(
-        "--ls-serial",
-        help="List 'Serial Number'/'Service Tag'",
-        action="store_true",
-    )
-    parser.add_argument(
-        "--check-virtual-media",
-        help="Check for mounted iso images",
-        action="store_true",
-    )
-    parser.add_argument(
-        "--mount-virtual-media",
-        help="Mount iso image to virtual CD. Arguments should be the address/path to the iso.",
-        default="",
-    )
-    parser.add_argument(
-        "--unmount-virtual-media",
-        help="Unmount any mounted iso images",
-        action="store_true",
-    )
-    parser.add_argument(
-        "--boot-to-virtual-media",
-        help="Boot to virtual media (Cd).",
-        action="store_true",
-    )
-    parser.add_argument(
-        "--check-remote-image",
-        help="Check the attach status of network ISO.",
-        action="store_true",
-    )
-    parser.add_argument(
-        "--boot-remote-image",
-        help="Boot to network ISO, through NFS, takes two arguments 'hostname:path' and name of the ISO 'linux.iso'.",
-        default="",
-    )
-    parser.add_argument(
-        "--detach-remote-image",
-        help="Remove attached network ISO.",
-        action="store_true",
-    )
-    parser.add_argument(
-        "--get-sriov",
-        help="Gets global SRIOV mode state",
-        action="store_true",
-    )
-    parser.add_argument(
-        "--enable-sriov",
-        help="Enables global SRIOV mode",
-        action="store_true",
-    )
-    parser.add_argument(
-        "--disable-sriov",
-        help="Disables global SRIOV mode",
-        action="store_true",
-    )
-    parser.add_argument(
-        "--get-bios-attribute",
-        help="Get a BIOS attribute value",
-        action="store_true",
-    )
-    parser.add_argument(
-        "--set-bios-attribute",
-        help="Set a BIOS attribute value",
-        action="store_true",
-    )
-    parser.add_argument(
-        "--attribute",
-        help="BIOS attribute name",
-        default="",
-    )
-    parser.add_argument(
-        "--value",
-        help="BIOS attribute value",
-        default="",
-    )
-    parser.add_argument(
-        "--set-bios-password",
-        help="Set the BIOS password",
-        action="store_true",
-    )
-    parser.add_argument(
-        "--remove-bios-password",
-        help="Removes BIOS password",
-        action="store_true",
-    )
-    parser.add_argument(
-        "--new-password",
-        help="The new password value",
-        default="",
-    )
-    parser.add_argument(
-        "--old-password",
-        help="The old password value",
-        default="",
-    )
-    parser.add_argument(
-        "--screenshot",
-        help="Take a screenshot of the system an store it in jpg format",
-        action="store_true",
+        "--host-list", help="Path to a plain text file with a list of hosts", default=None,
     )
     parser.add_argument("-v", "--verbose", help="Verbose output", action="store_true")
     parser.add_argument(
-        "-r",
-        "--retries",
-        help="Number of retries for executing actions.",
-        default=RETRIES,
+        "-r", "--retries", help="Number of retries for executing actions.", default=RETRIES,
+    )
+    
+    # Boot operations
+    parser.add_argument("--pxe", help="Set next boot to one-shot boot PXE", action="store_true")
+    parser.add_argument("--boot-to", help="Set next boot to one-shot boot to a specific device")
+    parser.add_argument(
+        "--boot-to-type", help="Set next boot to one-shot boot to a specific type as defined on iDRAC interfaces yaml",
     )
     parser.add_argument(
-        "--get-scp-targets",
-        help="Get allowable target values to export or import with iDRAC SCP. Choices=['Export', 'Import']",
-        choices=["Export", "Import"],
+        "--boot-to-mac", help="Set next boot to one-shot boot to a specific MAC address on the target",
+    )
+    parser.add_argument("--check-boot", help="Flag for checking the host boot order", action="store_true")
+    parser.add_argument(
+        "--toggle-boot-device", help="Change the enabled status of a boot device", default="",
+    )
+    
+    # Power operations
+    parser.add_argument("--reboot-only", help="Flag for only rebooting the host", action="store_true")
+    parser.add_argument("--power-cycle", help="Flag for sending ForceOff instruction to the host", action="store_true")
+    parser.add_argument("--power-state", help="Get power state", action="store_true")
+    parser.add_argument("--power-on", help="Power on host", action="store_true")
+    parser.add_argument("--power-off", help="Power off host", action="store_true")
+    parser.add_argument("--get-power-consumed", help="Get current consumed watts on host(s)", action="store_true")
+    
+    # Reset operations
+    parser.add_argument("--racreset", help="Flag for iDRAC reset", action="store_true")
+    parser.add_argument("--bmc-reset", help="Flag for BMC reset", action="store_true")
+    parser.add_argument("--factory-reset", help="Reset BIOS to default factory settings", action="store_true")
+    
+    # Job operations
+    parser.add_argument("--clear-jobs", help="Clear any scheduled jobs from the queue", action="store_true")
+    parser.add_argument("--check-job", help="Check a job status and details")
+    parser.add_argument("--ls-jobs", help="List any scheduled jobs in queue", action="store_true")
+    
+    # Inventory operations
+    parser.add_argument("--firmware-inventory", help="Get firmware inventory", action="store_true")
+    parser.add_argument("--ls-interfaces", help="List Network interfaces", action="store_true")
+    parser.add_argument("--ls-processors", help="List Processor Summary", action="store_true")
+    parser.add_argument("--ls-gpu", help="List GPU's on host", action="store_true")
+    parser.add_argument("--ls-memory", help="List Memory Summary", action="store_true")
+    parser.add_argument("--ls-serial", help="List 'Serial Number'/'Service Tag'", action="store_true")
+    
+    # Virtual media operations
+    parser.add_argument("--check-virtual-media", help="Check for mounted iso images", action="store_true")
+    parser.add_argument(
+        "--mount-virtual-media", help="Mount iso image to virtual CD. Arguments should be the address/path to the iso.",
         default="",
     )
+    parser.add_argument("--unmount-virtual-media", help="Unmount any mounted iso images", action="store_true")
+    parser.add_argument("--boot-to-virtual-media", help="Boot to virtual media (Cd).", action="store_true")
+    
+    # Remote image operations
+    parser.add_argument("--check-remote-image", help="Check the attach status of network ISO.", action="store_true")
     parser.add_argument(
-        "--scp-targets",
-        help="Comma separated targets which configs should be exported with iDRAC SCP.",
-        default="ALL",
-    )
-    parser.add_argument(
-        "--scp-include-read-only",
-        help="Flag for including read only attributes in SCP export.",
-        action="store_true",
-    )
-    parser.add_argument(
-        "--export-scp",
-        help="Export system config using iDRAC SCP, argument specifies where file should be saved.",
+        "--boot-remote-image", help="Boot to network ISO, through NFS, takes two arguments 'hostname:path' and name of the ISO 'linux.iso'.",
         default="",
     )
+    parser.add_argument("--detach-remote-image", help="Remove attached network ISO.", action="store_true")
+    
+    # SRIOV operations
+    parser.add_argument("--get-sriov", help="Gets global SRIOV mode state", action="store_true")
+    parser.add_argument("--enable-sriov", help="Enables global SRIOV mode", action="store_true")
+    parser.add_argument("--disable-sriov", help="Disables global SRIOV mode", action="store_true")
+    
+    # BIOS operations
+    parser.add_argument("--get-bios-attribute", help="Get a BIOS attribute value", action="store_true")
+    parser.add_argument("--set-bios-attribute", help="Set a BIOS attribute value", action="store_true")
+    parser.add_argument("--attribute", help="BIOS attribute name", default="")
+    parser.add_argument("--value", help="BIOS attribute value", default="")
+    parser.add_argument("--set-bios-password", help="Set the BIOS password", action="store_true")
+    parser.add_argument("--remove-bios-password", help="Removes BIOS password", action="store_true")
+    parser.add_argument("--new-password", help="The new password value", default="")
+    parser.add_argument("--old-password", help="The old password value", default="")
+    
+    # Screenshot
+    parser.add_argument("--screenshot", help="Take a screenshot of the system an store it in jpg format", action="store_true")
+    
+    # SCP operations
     parser.add_argument(
-        "--import-scp",
-        help="Import system config using iDRAC SCP, argument specifies which JSON file contains config that should be "
-        "imported.",
+        "--get-scp-targets", help="Get allowable target values to export or import with iDRAC SCP. Choices=['Export', 'Import']",
+        choices=["Export", "Import"], default="",
+    )
+    parser.add_argument(
+        "--scp-targets", help="Comma separated targets which configs should be exported with iDRAC SCP.", default="ALL",
+    )
+    parser.add_argument("--scp-include-read-only", help="Flag for including read only attributes in SCP export.", action="store_true")
+    parser.add_argument(
+        "--export-scp", help="Export system config using iDRAC SCP, argument specifies where file should be saved.", default="",
+    )
+    parser.add_argument(
+        "--import-scp", help="Import system config using iDRAC SCP, argument specifies which JSON file contains config that should be imported.",
         default="",
     )
-    parser.add_argument(
-        "--get-nic-fqdds",
-        help="List FQDDs for all NICs.",
-        action="store_true",
-    )
-    parser.add_argument(
-        "--get-nic-attribute",
-        help="Get a NIC attribute values, specify a NIC FQDD.",
-        default="",
-    )
-    parser.add_argument(
-        "--set-nic-attribute",
-        help="Set a NIC attribute value",
-        default="",
-    )
+    
+    # NIC operations
+    parser.add_argument("--get-nic-fqdds", help="List FQDDs for all NICs.", action="store_true")
+    parser.add_argument("--get-nic-attribute", help="Get a NIC attribute values, specify a NIC FQDD.", default="")
+    parser.add_argument("--set-nic-attribute", help="Set a NIC attribute value", default="")
+    
+    # Host identification
+    parser.add_argument("--rack", help="Rack identifier", default="")
+    parser.add_argument("--uloc", help="U-location identifier", default="")
+    parser.add_argument("--blade", help="Blade identifier", default="")
+    
+    # Delta comparison
+    parser.add_argument("--delta", help="Address of the other host between which the delta should be made", default="")
+    
+    return parser
 
-    _args = vars(parser.parse_args(argv))
 
-    log_level = DEBUG if _args["verbose"] else INFO
-    host = _args["host"]
-
+def process_delta_argument(_args: Dict[str, Any]) -> None:
+    """Process delta argument for firmware inventory comparison."""
     delta = _args["delta"]
     if _args["firmware_inventory"] and delta:
         tp = tempfile.NamedTemporaryFile()
-        tp.write(f"{host}\n{delta}".encode())
+        tp.write(f"{_args['host']}\n{delta}".encode())
         tp.flush()
         _args["host_list"] = tp.name
         if not _args["output"]:
             _args["output"] = "json"
 
+
+def setup_logging(_args: Dict[str, Any]) -> tuple[BadfishLogger, int]:
+    """Setup logging configuration."""
+    log_level = DEBUG if _args["verbose"] else INFO
     host_list = _args["host_list"]
-    multi_host = True if host_list else False
-    result = True
+    multi_host = bool(host_list)
     output = _args["output"]
     bfl = BadfishLogger(_args["verbose"], multi_host, _args["log"], output)
+    return bfl, log_level
 
-    loop = asyncio.get_event_loop()
+
+def process_host_list(host_list: str, _args: Dict[str, Any], bfl: BadfishLogger, log_level: int) -> tuple[list, dict]:
+    """Process host list file and create tasks."""
     tasks = []
     host_order = {}
-    if host_list:
-        try:
-            with open(host_list, "r") as _file:
-                for i, _host in enumerate(_file.readlines()):
-                    if _host.isspace():
-                        continue
+    
+    try:
+        with open(host_list, "r") as _file:
+            for i, _host in enumerate(_file.readlines()):
+                if _host.isspace():
+                    continue
 
-                    host_name = _host.strip().split(".")[0]
-                    host_order.update({host_name: i})
-                    logger = getLogger(host_name)
-                    logger.addHandler(bfl.queue_handler)
-                    logger.setLevel(log_level)
-                    bfl.badfish_handler.host = _host if output else None
-                    fn = functools.partial(
-                        execute_badfish,
-                        _host.strip(),
-                        _args,
-                        logger,
-                        bfl.queue_listener.handlers[0] if output else None,
-                    )
-                    tasks.append(fn)
-        except IOError as ex:
-            bfl.logger.debug(ex)
-            bfl.logger.error("There was something wrong reading from %s" % host_list)
-        results = []
-        try:
-            results = loop.run_until_complete(asyncio.gather(*[task() for task in tasks], return_exceptions=True))
-        except KeyboardInterrupt:
-            bfl.logger.warning("Badfish terminated")
-            result = False
-        except (asyncio.CancelledError, BadfishException) as ex:
-            bfl.logger.warning("There was something wrong executing Badfish")
-            bfl.logger.debug(ex)
-            result = False
-        if results and not output:
-            result = True
-            bfl.logger.info("RESULTS:")
-            for res in results:
-                if len(res) > 1 and res[1]:
-                    bfl.logger.info(f"{res[0]}: SUCCESSFUL")
-                else:
-                    bfl.logger.info(f"{res[0]}: FAILED")
-                    result = False
-    elif not host:
-        bfl.logger.error("You must specify at least either a host (-H) or a host list (--host-list).")
-    else:
-        try:
-            _host, result = loop.run_until_complete(
-                execute_badfish(host, _args, bfl.logger, bfl.queue_listener.handlers[0])
-            )
-        except KeyboardInterrupt:
-            bfl.logger.warning("Badfish terminated")
-        except BadfishException as ex:
-            bfl.logger.warning("There was something wrong executing Badfish")
-            bfl.logger.debug(ex)
-            result = False
-    bfl.queue_listener.stop()
+                host_name = _host.strip().split(".")[0]
+                host_order.update({host_name: i})
+                logger = getLogger(host_name)
+                logger.addHandler(bfl.queue_handler)
+                logger.setLevel(log_level)
+                bfl.badfish_handler.host = _host if _args["output"] else None
+                fn = functools.partial(
+                    execute_badfish,
+                    _host.strip(),
+                    _args,
+                    logger,
+                    bfl.queue_listener.handlers[0] if _args["output"] else None,
+                )
+                tasks.append(fn)
+    except IOError as ex:
+        bfl.logger.debug(ex)
+        bfl.logger.error("There was something wrong reading from %s" % host_list)
+    
+    return tasks, host_order
 
-    if delta:
+
+def run_tasks(tasks: list, bfl: BadfishLogger) -> tuple[list, bool]:
+    """Run async tasks and handle exceptions."""
+    results = []
+    result = True
+    
+    try:
+        loop = asyncio.get_event_loop()
+        results = loop.run_until_complete(asyncio.gather(*[task() for task in tasks], return_exceptions=True))
+    except KeyboardInterrupt:
+        bfl.logger.warning("Badfish terminated")
+        result = False
+    except (asyncio.CancelledError, BadfishException) as ex:
+        bfl.logger.warning("There was something wrong executing Badfish")
+        bfl.logger.debug(ex)
+        result = False
+    
+    return results, result
+
+
+def display_results(results: list, bfl: BadfishLogger, output: Optional[str]) -> bool:
+    """Display results for multi-host operations."""
+    if results and not output:
+        result = True
+        bfl.logger.info("RESULTS:")
+        for res in results:
+            if len(res) > 1 and res[1]:
+                bfl.logger.info(f"{res[0]}: SUCCESSFUL")
+            else:
+                bfl.logger.info(f"{res[0]}: FAILED")
+                result = False
+        return result
+    return True
+
+
+def main(argv=None) -> int:
+    """Main entry point for Badfish CLI."""
+    parser = create_argument_parser()
+    _args = vars(parser.parse_args(argv))
+    
+    # Process delta argument
+    process_delta_argument(_args)
+    
+    # Setup logging
+    bfl, log_level = setup_logging(_args)
+    
+    host = _args["host"]
+    host_list = _args["host_list"]
+    output = _args["output"]
+    result = True
+    
+    try:
+        if host_list:
+            # Multi-host operation
+            tasks, host_order = process_host_list(host_list, _args, bfl, log_level)
+            results, result = run_tasks(tasks, bfl)
+            result = display_results(results, bfl, output)
+            
+        elif not host:
+            bfl.logger.error("You must specify at least either a host (-H) or a host list (--host-list).")
+            return 1
+            
+        else:
+            # Single host operation
+            try:
+                loop = asyncio.get_event_loop()
+                _host, result = loop.run_until_complete(
+                    execute_badfish(host, _args, bfl.logger, bfl.queue_listener.handlers[0])
+                )
+            except KeyboardInterrupt:
+                bfl.logger.warning("Badfish terminated")
+                return 1
+            except BadfishException as ex:
+                bfl.logger.warning("There was something wrong executing Badfish")
+                bfl.logger.debug(ex)
+                return 1
+                
+    finally:
+        bfl.queue_listener.stop()
+    
+    # Handle output
+    if _args["delta"]:
         bfh_output = bfl.badfish_handler.diff()
     else:
-        bfh_output = bfl.badfish_handler.output(output if output else "normal", host_order)
+        bfh_output = bfl.badfish_handler.output(output if output else "normal", host_order if host_list else {})
+    
     if _args["log"]:
-        og_stdout = sys.stdout
         with open(_args["log"], "w") as f:
-            sys.stdout = f
-            print(bfh_output)
-            sys.stdout = og_stdout
-    else:
-        if bfh_output:
-            print(bfh_output, file=sys.stderr)
+            print(bfh_output, file=f)
+    elif bfh_output:
+        print(bfh_output, file=sys.stderr)
 
-    if result:
-        return 0
-    return 1
+    return 0 if result else 1
 
 
 if __name__ == "__main__":
