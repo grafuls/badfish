@@ -47,13 +47,13 @@ class HTTPClient:
     @alru_cache(maxsize=64)
     async def get_request(self, uri: str, _continue: bool = False, _get_token: bool = False):
         return await self.get_raw(uri, _continue, _get_token)
-    
+
     @alru_cache(maxsize=64)
     async def get_json(self, uri: str, _continue: bool = False, _get_token: bool = False):
         response = await self.get_raw(uri, _continue, _get_token)
         if not response:
             return None
-            
+
         # Parse JSON from response
         try:
             raw = await response.text("utf-8", "ignore")
