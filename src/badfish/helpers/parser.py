@@ -1,6 +1,6 @@
 import argparse
 
-from badfish.config import RETRIES
+from src.badfish.config import RETRIES
 
 
 def create_parser():
